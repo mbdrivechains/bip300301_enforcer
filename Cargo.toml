@@ -122,3 +122,9 @@ branch = "temp-dir-leak"
 [patch.crates-io.tracing-appender]
 git = "https://github.com/torkelrogstad/tokio-tracing.git"
 branch = "log-rotation-size"
+
+# LOCAL: our cusf-enforcer-mempool = upstream master 0c9e4c3 + our #611 fixes + the 600s apply-sync timeout
+# (branch mb/fixes-on-0c9e4c3, svr:/home/git-repos/cusf-enforcer-mempool.git).
+# Points the pinned git dep at the local worktree; drop this to revert to upstream.
+[patch."https://github.com/LayerTwo-Labs/cusf-enforcer-mempool.git"]
+cusf-enforcer-mempool = { path = "../cusf-mempool-mb/lib" }
