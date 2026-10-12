@@ -655,17 +655,19 @@ impl WalletInner {
         };
 
         let birthday_height = if generated {
-            let info = self
+            // getblockcount, not getblockchaininfo: the latter's typed `chain`
+            // field fails on a chain name rust-bitcoin does not know (easynet).
+            let blocks = self
                 .main_client
-                .get_blockchain_info()
+                .getblockcount()
                 .await
                 .map_err(|err| {
                     error::CreateNewWallet::FetchBirthdayHeight(error::BitcoinCoreRPC {
-                        method: "getblockchaininfo".to_owned(),
+                        method: "getblockcount".to_owned(),
                         error: err,
                     })
                 })?;
-            Some(info.blocks)
+            Some(blocks as u32)
         } else {
             None
         };

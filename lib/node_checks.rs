@@ -10,6 +10,37 @@ use thiserror::Error;
 
 use crate::validator::main_rest_client::{MainRestClient, MainRestClientError};
 
+/// The node's network, from `getblockchaininfo`'s `chain`. Bitcoin Core's
+/// names map as rust-bitcoin reads them. Easynet (mbdrivechains' test
+/// network, built from eCash) reports `easynet`; it uses testnet4's address
+/// prefixes, so the enforcer runs it as testnet4.
+pub fn network_from_core_chain(chain: &str) -> Option<bitcoin::Network> {
+    match chain {
+        "easynet" => Some(bitcoin::Network::Testnet4),
+        other => bitcoin::Network::from_core_arg(other).ok(),
+    }
+}
+
+/// `getblockchaininfo`'s chain name and height, read as plain JSON so a
+/// chain name rust-bitcoin does not know (easynet) does not fail the call.
+/// Map the name with [`network_from_core_chain`].
+#[derive(Debug, Deserialize)]
+pub struct NodeChainInfoRaw {
+    pub chain: String,
+    pub blocks: u32,
+}
+
+pub async fn get_node_chain_info_raw<C>(
+    client: &C,
+) -> Result<NodeChainInfoRaw, jsonrpsee::core::client::Error>
+where
+    C: ClientT + Sync,
+{
+    client
+        .request("getblockchaininfo", jsonrpsee::rpc_params![])
+        .await
+}
+
 /// Minimal subset of `getblockchaininfo` needed to detect pruning. The
 /// upstream `bitcoin_jsonrpsee::client::BlockchainInfo` type doesn't expose
 /// this field, so we decode it ourselves.
