@@ -1743,7 +1743,7 @@ async fn main() -> Result<()> {
         // If Bitcoin Core is booting up, we don't want to fail hard.
         // Check for errors that should go away after a little while,
         // and tolerate those.
-        let err = match mainchain_client.get_blockchain_info().await {
+        let err = match node_checks::get_node_chain_info_raw(&mainchain_client).await {
             Ok(info) => break 'info info,
             Err(err) => err,
         };
@@ -1790,6 +1790,17 @@ async fn main() -> Result<()> {
         tokio::time::sleep(RETRY_DELAY).await;
     };
 
+    // The node's chain name, mapped leniently: easynet reports `easynet`, which
+    // the enforcer runs as testnet4 (see `node_checks::network_from_core_chain`).
+    struct NodeChainInfo {
+        chain: bitcoin::Network,
+        blocks: u32,
+    }
+    let info = NodeChainInfo {
+        chain: node_checks::network_from_core_chain(&info.chain)
+            .ok_or_else(|| miette!("Bitcoin Core reports an unknown chain `{}`", info.chain))?,
+        blocks: info.blocks,
+    };
     tracing::info!(
         network = %info.chain,
         blocks = %info.blocks,
