@@ -322,6 +322,9 @@ pub enum NetworkPreset {
     /// Betanet: mainnet fork at block 967680. Mainnet-scale
     /// thresholds, with unused slots activating at 51%
     Betanet,
+    /// Easynet: mbdrivechains' CPU-mined test network on eCash rules, its
+    /// own genesis. Short thresholds (5 of 10 blocks)
+    Easynet,
     /// Integration-test-only preset: SHORT thresholds with BIP300/301
     /// activating at height 10, so tests can exercise the activation-height
     /// machinery on a fresh chain. Hidden from --help
@@ -334,6 +337,7 @@ impl NetworkPreset {
         match self {
             Self::Alphanet => NetworkParams::alphanet(),
             Self::Betanet => NetworkParams::betanet(),
+            Self::Easynet => NetworkParams::easynet(),
             Self::TestActivation => NetworkParams::test_activation(),
         }
     }
@@ -937,6 +941,8 @@ mod tests {
         };
         assert_eq!(params("alphanet").bip300_activation_height, 963_648);
         assert_eq!(params("betanet").bip300_activation_height, 967_680);
+        assert_eq!(params("easynet").bip300_activation_height, 0);
+        assert_eq!(params("easynet").network_magic, Some([0xea, 0x5e, 0x4e, 0x01]));
     }
 
     /// `--network-magic` overrides every automatic/configured source, since a

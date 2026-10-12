@@ -167,6 +167,23 @@ impl NetworkParams {
         }
     }
 
+    /// Easynet: mbdrivechains' public, CPU-mined test network on eCash rules
+    /// (github.com/mbdrivechains/bitcoin, branch `easynet`). It has its own
+    /// genesis, so BIP 300/301 enforce from genesis, with [`Thresholds::SHORT`]
+    /// so a developer can run a whole activation/deposit/withdrawal cycle in
+    /// hours. The node reports the chain as `easynet`; the enforcer runs it as
+    /// testnet4, whose address prefixes it shares (see
+    /// [`crate::node_checks::network_from_core_chain`]).
+    pub const fn easynet() -> Self {
+        Self {
+            thresholds: Thresholds::SHORT,
+            bip300_activation_height: 0,
+            datadir_suffix: Some("easynet"),
+            network_magic: Some([0xea, 0x5e, 0x4e, 0x01]),
+            op_drivechain: OpDrivechain::NOP8,
+        }
+    }
+
     /// Integration-test parameters: a tiny activation height on a fresh
     /// chain. See `NetworkPreset::TestActivation`.
     pub const fn test_activation() -> Self {
