@@ -942,7 +942,7 @@ mod tests {
         assert_eq!(params("alphanet").bip300_activation_height, 963_648);
         assert_eq!(params("betanet").bip300_activation_height, 967_680);
         assert_eq!(params("easynet").bip300_activation_height, 0);
-        assert_eq!(params("easynet").network_magic, Some([0xea, 0x5e, 0x4e, 0x01]));
+        assert_eq!(params("easynet").network_magic, Some([0xea, 0x5e, 0x4e, 0x03]));
     }
 
     /// `--network-magic` overrides every automatic/configured source, since a

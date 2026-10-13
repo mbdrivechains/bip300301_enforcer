@@ -179,7 +179,9 @@ impl NetworkParams {
             thresholds: Thresholds::SHORT,
             bip300_activation_height: 0,
             datadir_suffix: Some("easynet"),
-            network_magic: Some([0xea, 0x5e, 0x4e, 0x01]),
+            // The last byte follows easynet's resets (03 = reset 3,
+            // 2026-10-13); `--network-magic` overrides it.
+            network_magic: Some([0xea, 0x5e, 0x4e, 0x03]),
             op_drivechain: OpDrivechain::NOP8,
         }
     }
