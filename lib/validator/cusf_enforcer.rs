@@ -539,12 +539,21 @@ pub(crate) struct SidechainStateAfter {
     pub pending_m6ids: HashMap<SidechainNumber, PendingM6ids>,
 }
 
+/// Why a speculative block connect was rejected, and the transaction it
+/// failed on, if any, so a block template can be rebuilt without that
+/// transaction (bip300301_enforcer#634).
+#[derive(Debug)]
+pub(crate) struct DryRunRejection {
+    pub reason: String,
+    pub txid: Option<Txid>,
+}
+
 /// Get sidechain state after (speculatively) applying a block.
-/// Returns the rejection reason if the block would be rejected.
+/// Returns the rejection if the block would be rejected.
 pub(crate) fn get_sidechain_state_after(
     validator: &Validator,
     block: &Block,
-) -> Result<Result<SidechainStateAfter, String>, GetSidechainStateAfterError> {
+) -> Result<Result<SidechainStateAfter, DryRunRejection>, GetSidechainStateAfterError> {
     match ConnectBlockDryRun(|rotxn: &RoTxn<'_>| -> Result<_, db::error::Iter> {
         let ctips = validator
             .dbs
@@ -570,7 +579,19 @@ pub(crate) fn get_sidechain_state_after(
     .connect_block(validator, block)?
     {
         Ok(state) => Ok(Ok(state?)),
-        Err(reason) => Ok(Err(format!("{:#}", ErrorChain::new(&reason)))),
+        Err(reason) => {
+            let txid = match &reason {
+                RejectReason::ConnectBlock(task::error::JfyiConnectBlock::Transaction {
+                    txid,
+                    ..
+                }) => Some(*txid),
+                _ => None,
+            };
+            Ok(Err(DryRunRejection {
+                reason: format!("{:#}", ErrorChain::new(&reason)),
+                txid,
+            }))
+        }
     }
 }
 

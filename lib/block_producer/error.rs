@@ -464,7 +464,11 @@ pub(in crate::block_producer) enum FinalizeBlockTemplateInner {
     #[error(transparent)]
     CoinbaseMessages(#[from] CoinbaseMessagesError),
     #[error("Failed to apply initial block template: {reason}")]
-    InitialBlockTemplate { reason: String },
+    InitialBlockTemplate {
+        reason: String,
+        /// The transaction the dry run failed on, if any.
+        txid: Option<bitcoin::Txid>,
+    },
     #[error("Failed to generate coinbase txouts suffix")]
     GenerateSuffixCoinbaseTxouts(#[source] bitcoin::script::PushBytesError),
     #[error(transparent)]
@@ -481,6 +485,17 @@ pub(in crate::block_producer) enum FinalizeBlockTemplateInner {
 #[error(transparent)]
 #[repr(transparent)]
 pub struct FinalizeBlockTemplate(FinalizeBlockTemplateInner);
+
+impl FinalizeBlockTemplate {
+    /// The transaction the template's dry run failed on, if any
+    /// (bip300301_enforcer#634).
+    pub fn rejected_txid(&self) -> Option<bitcoin::Txid> {
+        match &self.0 {
+            FinalizeBlockTemplateInner::InitialBlockTemplate { txid, .. } => *txid,
+            _ => None,
+        }
+    }
+}
 
 impl<Err> From<Err> for FinalizeBlockTemplate
 where

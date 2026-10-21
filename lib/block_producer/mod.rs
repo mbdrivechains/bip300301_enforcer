@@ -335,6 +335,10 @@ impl CusfBlockProducer for BlockProducer {
         self.record_gbt_result(&res);
         res
     }
+
+    fn finalize_rejected_txid(err: &Self::FinalizeBlockTemplateError) -> Option<Txid> {
+        err.rejected_txid()
+    }
 }
 
 impl BlockProducer {
@@ -557,8 +561,11 @@ impl BlockProducer {
                     &self.inner.validator,
                     &block,
                 )?
-                .map_err(|reason| {
-                    error::FinalizeBlockTemplateInner::InitialBlockTemplate { reason }
+                .map_err(|rejection| {
+                    error::FinalizeBlockTemplateInner::InitialBlockTemplate {
+                        reason: rejection.reason,
+                        txid: rejection.txid,
+                    }
                 })?;
                 let suffix_txs = self
                     .generate_suffix_txs(&state_after.ctips, Some(&state_after.pending_m6ids))
