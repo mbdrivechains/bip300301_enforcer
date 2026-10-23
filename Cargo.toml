@@ -123,8 +123,9 @@ branch = "temp-dir-leak"
 git = "https://github.com/torkelrogstad/tokio-tracing.git"
 branch = "log-rotation-size"
 
-# LOCAL: our cusf-enforcer-mempool = upstream master 0c9e4c3 + our #611 fixes + the 600s apply-sync timeout
-# (branch mb/fixes-on-0c9e4c3, svr:/home/git-repos/cusf-enforcer-mempool.git).
-# Points the pinned git dep at the local worktree; drop this to revert to upstream.
+# Our cusf-enforcer-mempool, branch `mb/mainnet` (svr:/home/git-repos/cusf-enforcer-mempool.git, private): upstream
+# master 0c9e4c3 + our mempool-sync fixes, the 600s apply-sync timeout, the easynet block-template fixes, the
+# rejected-tx tombstone fix (upstream PR #88) and the bip300301_enforcer#634 retry. Built from a sibling worktree.
+# Drop this to revert to upstream.
 [patch."https://github.com/LayerTwo-Labs/cusf-enforcer-mempool.git"]
-cusf-enforcer-mempool = { path = "../cusf-mempool-mb/lib" }
+cusf-enforcer-mempool = { path = "../cusf-mempool-mainnet/lib" }
