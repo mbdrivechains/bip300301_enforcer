@@ -76,7 +76,12 @@ pub fn create_client(conf: &NodeRpcConfig) -> Result<HttpClient, Error> {
     // the RPC client at call site. Would require wrapping
     // the RPC client into a struct containing the config values?
     const MAX_RESPONSE_SIZE: u32 = 1 << 30;
-    const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+    // LOCAL (miner4 deploy 2026-09-04): 120s -> 600s. During background
+    // validation the node holds cs_main through slow disk IO and a batched
+    // getrawtransaction can take minutes; at 120s the live mempool sync died
+    // on the first such call ("Request timeout") and re-initialised. 600s
+    // waits it out; the runner's 10-min unserving guard bounds a real hang.
+    const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
     let client_builder = bitcoin_jsonrpsee::jsonrpsee::http_client::HttpClientBuilder::default()
         .max_request_size(MAX_REQUEST_SIZE)
