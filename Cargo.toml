@@ -122,3 +122,10 @@ branch = "temp-dir-leak"
 [patch.crates-io.tracing-appender]
 git = "https://github.com/torkelrogstad/tokio-tracing.git"
 branch = "log-rotation-size"
+
+# Our cusf-enforcer-mempool (branch `mainnet` of github.com/mbdrivechains/cusf-enforcer-mempool): upstream master
+# 0c9e4c3 + our mempool-sync fixes, the 600s apply-sync timeout, the easynet block-template fixes, the rejected-tx
+# tombstone fix (upstream PR #88), the bip300301_enforcer#634 retry and reconsidering rejected txs after each block.
+# Drop this to revert to upstream.
+[patch."https://github.com/LayerTwo-Labs/cusf-enforcer-mempool.git"]
+cusf-enforcer-mempool = { git = "https://github.com/mbdrivechains/cusf-enforcer-mempool.git", rev = "5e59860edb2254e4f4336fc5d47b165eb73da002" }
