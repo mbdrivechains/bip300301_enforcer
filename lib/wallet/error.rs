@@ -583,6 +583,8 @@ pub enum InitWallet {
     // it the report says initialization failed and not a word of why.
     #[error("failed to initialize wallet from mnemonic")]
     InitFromMnemonic(#[source] Box<InitWalletFromMnemonic>),
+    #[error("failed to read the node's genesis block hash")]
+    GetGenesisHash(#[source] BitcoinCoreRPC),
     #[error("no signet challenge found")]
     NoSignetChallengeFound,
     #[error("failed to open connection to wallet DB")]
