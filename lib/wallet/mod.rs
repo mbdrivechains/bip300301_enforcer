@@ -278,6 +278,8 @@ fn wallet_transaction_sort_key(tx: &BDKWalletTransaction) -> (Option<u64>, Txid)
 
 struct WalletInner {
     main_client: HttpClient,
+    /// The node's genesis block, for new BDK wallets.
+    genesis_hash: bdk_wallet::bitcoin::BlockHash,
     producer: BlockProducer,
     magic: bitcoin::p2p::Magic,
     /// The BDK wallet and its persistence. Held together so that we
@@ -475,9 +477,13 @@ impl WalletInner {
             .await
     }
 
+    /// `genesis_hash` is the node's: a chain the enforcer runs under another
+    /// network's parameters (easynet, as testnet4) has its own genesis, and a
+    /// BDK wallet made with the network's could never connect block 1.
     async fn initialize_wallet_from_mnemonic(
         mnemonic: &Mnemonic,
         network: bdk_wallet::bitcoin::Network,
+        genesis_hash: bdk_wallet::bitcoin::BlockHash,
         config: &WalletConfig,
         wallet_database: &mut Persistence,
     ) -> Result<BdkWallet, error::InitWalletFromMnemonic> {
@@ -502,6 +508,7 @@ impl WalletInner {
                     internal_desc.as_str().to_owned(),
                 )
                 .network(network)
+                .genesis_hash(genesis_hash)
                 .create_wallet_async(wallet_database)
                 .await?;
                 (wallet, external_desc, internal_desc)
@@ -586,6 +593,13 @@ impl WalletInner {
             return Err(error::InitWallet::NoSignetChallengeFound);
         }
 
+        let genesis_hash = main_client.getblockhash(0).await.map_err(|err| {
+            error::InitWallet::GetGenesisHash(error::BitcoinCoreRPC {
+                method: "getblockhash".to_owned(),
+                error: err,
+            })
+        })?;
+
         let database_path = data_dir.join("wallet.sqlite.db");
 
         tracing::info!(
@@ -617,6 +631,7 @@ impl WalletInner {
                 let initialized = WalletInner::initialize_wallet_from_mnemonic(
                     &mnemonic,
                     network,
+                    genesis_hash,
                     &config.wallet_opts,
                     &mut wallet_database,
                 )
@@ -635,6 +650,7 @@ impl WalletInner {
         let inner = Self {
             config: config.clone(),
             main_client,
+            genesis_hash,
             producer,
             magic,
             locks: locks::WalletLocks::new(bitcoin_wallet, wallet_database),
@@ -753,6 +769,7 @@ impl WalletInner {
         let wallet = WalletInner::initialize_wallet_from_mnemonic(
             &mnemonic,
             network,
+            self.genesis_hash,
             &self.config.wallet_opts,
             &mut database,
         )
@@ -803,6 +820,7 @@ impl WalletInner {
         let wallet = WalletInner::initialize_wallet_from_mnemonic(
             &mnemonic,
             network,
+            self.genesis_hash,
             &self.config.wallet_opts,
             &mut database,
         )
