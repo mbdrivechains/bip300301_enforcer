@@ -21,6 +21,7 @@ mod test_generate_to_address;
 mod test_inactive_drivechain_output;
 mod test_invalid_block;
 mod test_invalid_block_during_sync;
+mod test_mempool_deep_chain_reorg;
 mod test_mempool_dat_sync;
 mod test_mine_rejected_block;
 mod test_no_secrets_in_logs;

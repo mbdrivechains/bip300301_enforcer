@@ -1217,6 +1217,20 @@ pub fn tests(
             crate::test_bmm_same_bid_after_stale::test_bmm_same_bid_after_stale,
         )
     }));
+    // Deep mempool chains, CPFP, RBF and a reorg handing a block's txs back
+    // to the mempool, with templates requested throughout (the 2026-10-29
+    // "Amount subtraction error" crash).
+    async_trials.push(new_trial_with_setup(
+        "mempool_deep_chain_reorg".to_owned(),
+        TestSetupComponents {
+            bin_paths: bin_paths.clone(),
+            network: Network::Regtest,
+            mode: Mode::GetBlockTemplate,
+            file_registry: file_registry.clone(),
+            failure_collector: failure_collector.clone(),
+        },
+        crate::test_mempool_deep_chain_reorg::test_mempool_deep_chain_reorg,
+    ));
     async_trials.extend([Mode::Mempool, Mode::GetBlockTemplate].map(|mode| {
         new_trial_with_setup(
             format!("sidechain_proposal_reorg (mode: {mode})"),

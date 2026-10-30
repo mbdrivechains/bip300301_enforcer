@@ -163,7 +163,7 @@ async fn create_wallet_bid(
 /// onto unconfirmed change or touch earlier bids' UTXOs. `pad_outputs` extra
 /// change outputs inflate the transaction's size, lowering its fee rate
 /// without touching the bid.
-async fn craft_core_bid(
+pub(crate) async fn craft_core_bid(
     post_setup: &PostSetup,
     slot: SidechainNumber,
     bid_sats: u64,
