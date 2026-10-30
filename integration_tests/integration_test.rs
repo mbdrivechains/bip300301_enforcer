@@ -1217,6 +1217,21 @@ pub fn tests(
             crate::test_bmm_same_bid_after_stale::test_bmm_same_bid_after_stale,
         )
     }));
+    // A re-bid after a stale round avoids the stale bid's coin, or pays
+    // enough to replace it at nodes that still hold it at full fee. Mempool
+    // mode: served coinbases would add coins to the wallet in
+    // GetBlockTemplate mode.
+    async_trials.push(new_trial_with_setup(
+        "bmm_rebid_coin_choice".to_owned(),
+        TestSetupComponents {
+            bin_paths: bin_paths.clone(),
+            network: Network::Regtest,
+            mode: Mode::Mempool,
+            file_registry: file_registry.clone(),
+            failure_collector: failure_collector.clone(),
+        },
+        crate::test_bmm_same_bid_after_stale::test_bmm_rebid_coin_choice,
+    ));
     // Deep mempool chains, CPFP, RBF and a reorg handing a block's txs back
     // to the mempool, with templates requested throughout (the 2026-10-29
     // "Amount subtraction error" crash).

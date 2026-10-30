@@ -1876,6 +1876,7 @@ impl Wallet {
         message: &PushBytesBuf,
         bid_amount: bdk_wallet::bitcoin::Amount,
         locktime: bdk_wallet::bitcoin::absolute::LockTime,
+        unspendable: Vec<bdk_wallet::bitcoin::OutPoint>,
     ) -> Result<bdk_wallet::bitcoin::psbt::Psbt, bdk_wallet::error::CreateTxError> {
         let mut builder = wallet.build_tx();
         // BIP301 requires the M8 OP_RETURN at output zero.
@@ -1883,7 +1884,130 @@ impl Wallet {
         builder.nlocktime(locktime);
         builder.add_data(message);
         builder.fee_absolute(bid_amount);
+        builder.unspendable(unspendable);
         builder.finish()
+    }
+
+    /// Wallet coins that a stale BMM request (one not bidding on
+    /// `mainchain_tip`) spent, each with that request's fee. The wallet has
+    /// evicted those requests and counts the coins unspent again, but the
+    /// requests can linger at full fee in the mempools of nodes whose
+    /// enforcer has not deprioritised them (or that run none).
+    fn stale_spent_coins(
+        wallet: &bdk_wallet::Wallet,
+        mainchain_tip: bitcoin::BlockHash,
+    ) -> HashMap<bdk_wallet::bitcoin::OutPoint, (bdk_wallet::bitcoin::Txid, Amount)> {
+        let graph = wallet.tx_graph();
+        wallet
+            .list_unspent()
+            .filter_map(|utxo| {
+                graph.outspends(utxo.outpoint).iter().find_map(|txid| {
+                    let tx = graph.get_tx(*txid)?;
+                    let script = tx.output.first()?.script_pubkey.to_bytes();
+                    let (_rest, m8) = M8BmmRequest::parse(&script).ok()?;
+                    if m8.prev_mainchain_block_hash == mainchain_tip {
+                        return None;
+                    }
+                    let fee = graph.calculate_fee(&tx).ok()?;
+                    Some((utxo.outpoint, (*txid, fee)))
+                })
+            })
+            .collect()
+    }
+
+    /// Build a BMM request paying `bid_amount`, preferring coins no stale
+    /// BMM request spent.
+    ///
+    /// Re-spending a stale request's coin at the same fee only works on nodes
+    /// whose enforcer already deprioritised the stale request; every other
+    /// node refuses it as an RBF replacement that pays no more, so it never
+    /// reaches the pools. Only if no other coin can pay, reuse one, paying
+    /// what replaces the stale requests at every node: their fees plus
+    /// `increment_sat_per_kvb` for the new request's size. Returns the PSBT
+    /// and the fee it pays.
+    fn build_bmm_psbt_avoiding_stale(
+        wallet: &mut bdk_wallet::Wallet,
+        message: &PushBytesBuf,
+        bid_amount: bdk_wallet::bitcoin::Amount,
+        locktime: bdk_wallet::bitcoin::absolute::LockTime,
+        mainchain_tip: bitcoin::BlockHash,
+        increment_sat_per_kvb: u64,
+    ) -> Result<(bdk_wallet::bitcoin::psbt::Psbt, Amount), bdk_wallet::error::CreateTxError> {
+        /// Enough for any single-key input's signature data, so the estimate
+        /// of the signed request's size errs high.
+        const MAX_INPUT_WITNESS_VBYTES: u64 = 110;
+        const MAX_ATTEMPTS: usize = 3;
+        let stale_spent = Self::stale_spent_coins(wallet, mainchain_tip);
+        if stale_spent.is_empty() {
+            let psbt = Self::build_bmm_psbt(wallet, message, bid_amount, locktime, Vec::new())?;
+            return Ok((psbt, bid_amount));
+        }
+        match Self::build_bmm_psbt(
+            wallet,
+            message,
+            bid_amount,
+            locktime,
+            stale_spent.keys().copied().collect(),
+        ) {
+            Ok(psbt) => return Ok((psbt, bid_amount)),
+            // Only coins a stale request spent can pay.
+            Err(bdk_wallet::error::CreateTxError::CoinSelection(_)) => (),
+            Err(err) => return Err(err),
+        }
+        let mut fee = bid_amount;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let psbt = Self::build_bmm_psbt(wallet, message, fee, locktime, Vec::new())?;
+            let mut replaced: Vec<(bdk_wallet::bitcoin::Txid, Amount)> = psbt
+                .unsigned_tx
+                .input
+                .iter()
+                .filter_map(|input| stale_spent.get(&input.previous_output).copied())
+                .collect();
+            replaced.sort_unstable();
+            replaced.dedup();
+            let replaced_fees: Amount = replaced.iter().map(|(_txid, fee)| *fee).sum();
+            let vsize = psbt.unsigned_tx.vsize() as u64
+                + MAX_INPUT_WITNESS_VBYTES * psbt.unsigned_tx.input.len() as u64;
+            let required = replaced_fees
+                + Amount::from_sat((increment_sat_per_kvb * vsize).div_ceil(1000));
+            if fee >= required || attempt == MAX_ATTEMPTS {
+                tracing::info!(
+                    bid = %bid_amount,
+                    %fee,
+                    replaces = ?replaced.iter().map(|(txid, _)| *txid).collect::<Vec<_>>(),
+                    "BMM request: only coins stale requests spent can pay; reusing one, \
+                     paying enough to replace them",
+                );
+                return Ok((psbt, fee));
+            }
+            fee = required;
+        }
+    }
+
+    /// The fee rate a replacement must add for every node to relay it: our
+    /// node's `incrementalfee`, but at least 1 sat/vB, the default before
+    /// Bitcoin Core 29.1 that many nodes still run.
+    async fn replacement_increment_sat_per_kvb(&self) -> u64 {
+        use jsonrpsee::core::client::ClientT as _;
+        const FLOOR_SAT_PER_KVB: u64 = 1_000;
+        let own = match self
+            .inner
+            .main_client
+            .request::<serde_json::Value, _>("getnetworkinfo", jsonrpsee::rpc_params![])
+            .await
+        {
+            Ok(info) => info["incrementalfee"]
+                .as_f64()
+                .and_then(|btc_per_kvb| Amount::from_btc(btc_per_kvb).ok())
+                .map(|amount| amount.to_sat()),
+            Err(err) => {
+                tracing::warn!("getnetworkinfo failed, assuming the floor incrementalfee: {err:#}");
+                None
+            }
+        };
+        own.unwrap_or(FLOOR_SAT_PER_KVB).max(FLOOR_SAT_PER_KVB)
     }
 
     /// Evict every unconfirmed BMM request whose `prev_mainchain_block_hash`
@@ -1945,6 +2069,7 @@ impl Wallet {
         // later), and persist.
         const WALLET_CATCH_UP: Duration = Duration::from_secs(10);
         const WALLET_CATCH_UP_POLL: Duration = Duration::from_millis(5);
+        let increment_sat_per_kvb = self.replacement_increment_sat_per_kvb().await;
         let prev_height = self
             .inner
             .validator()
@@ -2000,7 +2125,14 @@ impl Wallet {
         let (built, persist) = tokio::task::block_in_place(|| {
             wallet_write.with_mut(|wallet| {
                 let _stale = Self::evict_stale_bmm_requests(wallet, wallet_tip);
-                let built = Self::build_bmm_psbt(wallet, &message, bid_amount, locktime);
+                let built = Self::build_bmm_psbt_avoiding_stale(
+                    wallet,
+                    &message,
+                    bid_amount,
+                    locktime,
+                    wallet_tip,
+                    increment_sat_per_kvb,
+                );
                 (built, wallet.persist_async(&mut bdk_db))
             })
         });
@@ -2009,7 +2141,8 @@ impl Wallet {
             .map_err(|err| error::BuildBmmTx::PersistWallet(error::SqliteError::from(err)))?;
         drop(bdk_db);
         drop(wallet_write);
-        Ok(built?)
+        let (psbt, _fee) = built?;
+        Ok(psbt)
     }
 
     /// Deprioritise, in our own node, every stale BMM request that `tx`
