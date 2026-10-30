@@ -10,6 +10,7 @@ mod test_aggregated_deposit_weight;
 mod test_aggregated_deposits;
 mod test_blinded_m6_roundtrip;
 mod test_bmm_bid_auction;
+mod test_bmm_same_bid_after_stale;
 mod test_bundle_proposal_order;
 mod test_consecutive_deposits;
 mod test_file_based_block_parser;

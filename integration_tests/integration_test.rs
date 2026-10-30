@@ -1202,6 +1202,21 @@ pub fn tests(
             test_bmm_bid_auction::test_bmm_stale_request_after_reorg,
         )
     }));
+    // A sidechain bidding the same amount every block, with every other bid
+    // going stale in Bitcoin Core's mempool, in both block production modes.
+    async_trials.extend([Mode::GetBlockTemplate, Mode::Mempool].map(|mode| {
+        new_trial_with_setup(
+            format!("bmm_same_bid_after_stale (mode: {mode})"),
+            TestSetupComponents {
+                bin_paths: bin_paths.clone(),
+                network: Network::Regtest,
+                mode,
+                file_registry: file_registry.clone(),
+                failure_collector: failure_collector.clone(),
+            },
+            crate::test_bmm_same_bid_after_stale::test_bmm_same_bid_after_stale,
+        )
+    }));
     async_trials.extend([Mode::Mempool, Mode::GetBlockTemplate].map(|mode| {
         new_trial_with_setup(
             format!("sidechain_proposal_reorg (mode: {mode})"),

@@ -66,13 +66,13 @@ const BIG_LOW_FEERATE_BID: u64 = 30_000;
 /// rate well below the small bid's.
 const BIG_BID_PAD_OUTPUTS: usize = 40;
 
-fn h_star(label: &str) -> [u8; 32] {
+pub(crate) fn h_star(label: &str) -> [u8; 32] {
     bitcoin::hashes::sha256::Hash::hash(label.as_bytes()).to_byte_array()
 }
 
 /// The validator's chain tip: the proto hash (for `prev_bytes`), the decoded
 /// hash, and the height.
-async fn chain_tip(post_setup: &mut PostSetup) -> anyhow::Result<(ReverseHex, BlockHash, u32)> {
+pub(crate) async fn chain_tip(post_setup: &mut PostSetup) -> anyhow::Result<(ReverseHex, BlockHash, u32)> {
     let header_info = post_setup
         .validator_service_client
         .get_chain_tip(GetChainTipRequest::default())
@@ -254,7 +254,7 @@ async fn craft_core_bid(
     Ok(txid)
 }
 
-async fn get_raw_transaction(
+pub(crate) async fn get_raw_transaction(
     post_setup: &PostSetup,
     txid: &Txid,
 ) -> anyhow::Result<bitcoin::Transaction> {
@@ -266,7 +266,7 @@ async fn get_raw_transaction(
     Ok(tx)
 }
 
-async fn get_block(
+pub(crate) async fn get_block(
     post_setup: &PostSetup,
     block_hash: &BlockHash,
 ) -> anyhow::Result<bitcoin::Block> {
@@ -279,7 +279,7 @@ async fn get_block(
 }
 
 /// All M7 BMM accepts in a block's coinbase.
-fn coinbase_m7_accepts(block: &bitcoin::Block) -> anyhow::Result<Vec<M7BmmAccept>> {
+pub(crate) fn coinbase_m7_accepts(block: &bitcoin::Block) -> anyhow::Result<Vec<M7BmmAccept>> {
     let coinbase = block
         .txdata
         .first()
@@ -295,7 +295,7 @@ fn coinbase_m7_accepts(block: &bitcoin::Block) -> anyhow::Result<Vec<M7BmmAccept
 }
 
 /// The enforcer's current block template.
-async fn block_template(
+pub(crate) async fn block_template(
     post_setup: &PostSetup,
 ) -> anyhow::Result<bitcoin_jsonrpsee::client::BlockTemplate> {
     use cusf_enforcer_mempool::server::RpcClient as _;
@@ -309,7 +309,7 @@ async fn block_template(
     )
 }
 
-fn template_txids(template: &bitcoin_jsonrpsee::client::BlockTemplate) -> Vec<Txid> {
+pub(crate) fn template_txids(template: &bitcoin_jsonrpsee::client::BlockTemplate) -> Vec<Txid> {
     template.transactions.iter().map(|tx| tx.txid).collect()
 }
 
@@ -423,7 +423,7 @@ async fn mine_and_check_commitment(
     Ok((block, height))
 }
 
-fn block_txids(block: &bitcoin::Block) -> Vec<Txid> {
+pub(crate) fn block_txids(block: &bitcoin::Block) -> Vec<Txid> {
     block.txdata.iter().map(|tx| tx.compute_txid()).collect()
 }
 
