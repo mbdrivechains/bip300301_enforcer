@@ -1932,13 +1932,198 @@ impl Wallet {
             prev_mainchain_block_hash,
         )?;
 
-        let mut wallet_write = self.inner.write_wallet().await?;
-        let psbt = tokio::task::block_in_place(|| {
-            wallet_write
-                .with_mut(|wallet| Self::build_bmm_psbt(wallet, &message, bid_amount, locktime))
-        })?;
+        // The validator's tip moves a few ms before the wallet connects the
+        // block that moved it. A bid built in between sees the wallet as of
+        // the previous tip: a request the new block left stale still counts
+        // as unconfirmed, and coin selection could spend its change (a child
+        // of a request that can never confirm, which the node takes but no
+        // template ever carries). Evicting by the new tip right away is no
+        // answer either: a request the new block confirmed would look stale
+        // too, and its spent input free. So wait for the wallet to connect
+        // the tip first, then evict stale requests under the same lock as
+        // coin selection (the block-connect eviction takes the lock again
+        // later), and persist.
+        const WALLET_CATCH_UP: Duration = Duration::from_secs(10);
+        const WALLET_CATCH_UP_POLL: Duration = Duration::from_millis(5);
+        let prev_height = self
+            .inner
+            .validator()
+            .get_header_info(&convert::bdk_block_hash_to_bitcoin_block_hash(
+                prev_mainchain_block_hash,
+            ))?
+            .height;
+        let started = Instant::now();
+        let deadline = started + WALLET_CATCH_UP;
+        let mut waited = false;
+        let mut wallet_write = loop {
+            let wallet_write = self.inner.write_wallet().await?;
+            let local_chain = wallet_write.local_chain();
+            if local_chain
+                .get(prev_height)
+                .is_some_and(|checkpoint| checkpoint.hash() == prev_mainchain_block_hash)
+            {
+                if waited {
+                    tracing::info!(
+                        %prev_mainchain_block_hash,
+                        waited = ?started.elapsed(),
+                        "BMM request: wallet connected the tip, building"
+                    );
+                }
+                break wallet_write;
+            }
+            let wallet_tip = local_chain.tip().block_id();
+            drop(wallet_write);
+            if !waited {
+                tracing::debug!(
+                    %prev_mainchain_block_hash,
+                    wallet_tip = %wallet_tip.hash,
+                    "BMM request: waiting for the wallet to connect the tip"
+                );
+                waited = true;
+            }
+            if Instant::now() >= deadline {
+                return Err(error::BuildBmmTx::WalletBehindTip {
+                    tip: convert::bdk_block_hash_to_bitcoin_block_hash(prev_mainchain_block_hash),
+                    tip_height: prev_height,
+                    wallet_tip: convert::bdk_block_hash_to_bitcoin_block_hash(wallet_tip.hash),
+                    wallet_tip_height: wallet_tip.height,
+                });
+            }
+            tokio::time::sleep(WALLET_CATCH_UP_POLL).await;
+        };
+        // Judge staleness against the wallet's tip: past `prev_height` only
+        // if yet another block arrived meanwhile, which makes this bid stale
+        // anyway.
+        let wallet_tip =
+            convert::bdk_block_hash_to_bitcoin_block_hash(wallet_write.local_chain().tip().hash());
+        let mut bdk_db = self.inner.locks.db(&wallet_write).await;
+        let (built, persist) = tokio::task::block_in_place(|| {
+            wallet_write.with_mut(|wallet| {
+                let _stale = Self::evict_stale_bmm_requests(wallet, wallet_tip);
+                let built = Self::build_bmm_psbt(wallet, &message, bid_amount, locktime);
+                (built, wallet.persist_async(&mut bdk_db))
+            })
+        });
+        let _changed: bool = persist
+            .await
+            .map_err(|err| error::BuildBmmTx::PersistWallet(error::SqliteError::from(err)))?;
+        drop(bdk_db);
+        drop(wallet_write);
+        Ok(built?)
+    }
 
-        Ok(psbt)
+    /// Deprioritise, in our own node, every stale BMM request that `tx`
+    /// conflicts with, and return their txids.
+    ///
+    /// A stale request (one whose `prev_mainchain_block_hash` is not the tip
+    /// `tx` bids on) can never confirm, but it stays in the node's mempool.
+    /// The mempool sync deprioritises it when it connects the block that
+    /// made it stale, a few ms after the validator's tip moves. A bid built
+    /// in that window can reuse the stale request's freed input, and the node
+    /// would refuse it as an RBF replacement paying no more than the stale
+    /// request. Deprioritising first makes the replacement valid. Requests
+    /// already carrying a negative delta are left alone, since
+    /// `prioritisetransaction` deltas add up. Failures are logged, not
+    /// returned: the broadcast reports whatever the node still refuses.
+    async fn deprioritize_stale_bmm_conflicts(
+        &self,
+        tx: &bdk_wallet::bitcoin::Transaction,
+        mainchain_tip: bitcoin::BlockHash,
+    ) -> Vec<bitcoin::Txid> {
+        use jsonrpsee::core::client::ClientT as _;
+
+        /// Same delta the mempool sync uses to reject a tx.
+        const NEGATIVE_MAX_SATS: i64 = -(21_000_000 * 100_000_000);
+
+        #[derive(Deserialize)]
+        struct SpendingPrevout {
+            spendingtxid: Option<bitcoin::Txid>,
+        }
+
+        let own_txid = convert::bdk_txid_to_bitcoin_txid(tx.compute_txid());
+        let outpoints: Vec<serde_json::Value> = tx
+            .input
+            .iter()
+            .map(|input| {
+                serde_json::json!({
+                    "txid": input.previous_output.txid.to_string(),
+                    "vout": input.previous_output.vout,
+                })
+            })
+            .collect();
+        let spends: Vec<SpendingPrevout> = match self
+            .inner
+            .main_client
+            .request("gettxspendingprevout", jsonrpsee::rpc_params![outpoints])
+            .await
+        {
+            Ok(spends) => spends,
+            Err(err) => {
+                tracing::warn!(
+                    %own_txid,
+                    "BMM request: cannot look up mempool conflicts: {:#}",
+                    ErrorChain::new(&err)
+                );
+                return Vec::new();
+            }
+        };
+        let mut conflicts: Vec<bitcoin::Txid> = spends
+            .into_iter()
+            .filter_map(|spend| spend.spendingtxid)
+            .filter(|txid| *txid != own_txid)
+            .collect();
+        conflicts.sort_unstable();
+        conflicts.dedup();
+        let mut deprioritized = Vec::new();
+        for txid in conflicts {
+            let conflict = match self.fetch_transaction(txid).await {
+                Ok(conflict) => conflict,
+                Err(err) => {
+                    tracing::warn!(%txid, "BMM request: cannot fetch conflicting tx: {err:#}");
+                    continue;
+                }
+            };
+            let stale = conflict.output.first().is_some_and(|output| {
+                M8BmmRequest::parse(output.script_pubkey.as_bytes())
+                    .is_ok_and(|(_rest, m8)| m8.prev_mainchain_block_hash != mainchain_tip)
+            });
+            if !stale {
+                continue;
+            }
+            match self.inner.main_client.get_mempool_entry(txid).await {
+                Ok(entry) => {
+                    let base = i64::try_from(entry.fees.base.to_sat()).unwrap_or(i64::MAX);
+                    if entry.fees.modified.to_sat() < base {
+                        tracing::debug!(%txid, "BMM request: conflicting stale request already deprioritized");
+                        continue;
+                    }
+                }
+                Err(err) => {
+                    tracing::debug!(%txid, "BMM request: conflicting stale request not in mempool: {err:#}");
+                    continue;
+                }
+            }
+            match self
+                .inner
+                .main_client
+                .prioritize_transaction(txid, NEGATIVE_MAX_SATS)
+                .await
+            {
+                Ok(_) => {
+                    tracing::info!(
+                        %txid,
+                        replacement = %own_txid,
+                        "BMM request: deprioritized conflicting stale request in own node"
+                    );
+                    deprioritized.push(txid);
+                }
+                Err(err) => tracing::warn!(
+                    %txid,
+                    "BMM request: failed to deprioritize conflicting stale request: {err:#}"
+                ),
+            }
+        }
+        deprioritized
     }
 
     /// Creates a BMM request transaction and broadcasts it via the p2p
@@ -1967,6 +2152,12 @@ impl Wallet {
         let tx = self.sign_bmm_request_transaction(psbt).await?;
         tracing::info!("BMM request: PSBT signed successfully");
         let txid = tx.compute_txid();
+        let _deprioritized: Vec<bitcoin::Txid> = self
+            .deprioritize_stale_bmm_conflicts(
+                &tx,
+                convert::bdk_block_hash_to_bitcoin_block_hash(prev_mainchain_block_hash),
+            )
+            .await;
         let block_height = self
             .inner
             .validator()
@@ -2016,6 +2207,11 @@ impl Wallet {
             }
             None => {
                 tracing::info!(%txid, "Own node rejected BMM request transaction from its mempool");
+                // Without a p2p broadcast, the request reached no node.
+                if broadcast_successfully.is_none() {
+                    let txid = convert::bdk_txid_to_bitcoin_txid(txid);
+                    return Err(error::CreateBmmRequestInner::NotBroadcast { txid }.into());
+                }
             }
         }
         Ok(tx)

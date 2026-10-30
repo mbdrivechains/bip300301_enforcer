@@ -20,6 +20,10 @@
 //!   reacting to a new tip would
 //! * tip-poll: the re-bid goes out the moment the enforcer's chain tip (polled
 //!   back to back) moves to that block, the fastest a sidechain can react
+//! * forced: as settled, but the test first undoes the enforcer's
+//!   deprioritisation of the stale bid in Core, recreating the window in
+//!   which the stale bid is still full-fee there. Only the wallet
+//!   deprioritising it itself lets the same-amount re-bid replace it
 //!
 //! Observed (2026-10-30, eCash v1.2.0 regtest, enforcer v1.0.1 + our fixes):
 //! the enforcer deprioritises a stale bid in Core (`prioritisetransaction`,
@@ -70,6 +74,10 @@ const BID_SATS: u64 = 5_000;
 const SETTLED_PAIRS: u32 = 5;
 const IMMEDIATE_PAIRS: u32 = 10;
 const TIP_POLL_PAIRS: u32 = 15;
+const FORCED_PAIRS: u32 = 3;
+/// `prioritisetransaction` delta the enforcer uses to reject a tx; deltas add
+/// up, so adding its negation undoes it.
+const NEGATIVE_MAX_SATS: i64 = -(21_000_000 * 100_000_000);
 /// How long a bid the enforcer reports as created may take to show up in
 /// Bitcoin Core's mempool before the round records it as missing.
 const MEMPOOL_WAIT: Duration = Duration::from_secs(10);
@@ -92,11 +100,24 @@ enum Kind {
     /// Bid the moment the enforcer's chain tip moves to the stale round's
     /// block, then mine through the enforcer.
     TipPoll,
+    /// As [`Kind::Normal`], after the stale round undid the enforcer's
+    /// deprioritisation of the stale bid in Core.
+    Forced,
 }
 
 impl Kind {
     fn is_fast_rebid(self) -> bool {
         matches!(self, Self::Immediate | Self::TipPoll)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "settled",
+            Self::Stale => "STALE",
+            Self::Immediate => "immediate",
+            Self::TipPoll => "tip-poll",
+            Self::Forced => "forced",
+        }
     }
 }
 
@@ -283,6 +304,8 @@ struct Row {
     tip_ms: Option<u128>,
     template_tip_ms: Option<u128>,
     evict_ms: Option<Option<u128>>,
+    /// The test undid the enforcer's deprioritisation of this stale bid.
+    delta_undone: bool,
     block_height: u32,
     bid_in_block: bool,
     m7_ours: bool,
@@ -293,7 +316,7 @@ impl Row {
         self.round > 0
             && matches!(
                 self.kind,
-                Some(Kind::Normal | Kind::Immediate | Kind::TipPoll)
+                Some(Kind::Normal | Kind::Immediate | Kind::TipPoll | Kind::Forced)
             )
     }
 
@@ -320,10 +343,13 @@ impl Row {
             if let Some(template_tip_ms) = self.template_tip_ms {
                 block.push_str(&format!(", template {template_tip_ms}ms"));
             }
-            match self.evict_ms {
-                Some(evict_ms) => block.push_str(&format!(", wallet freed {})", ms(evict_ms))),
-                None => block.push(')'),
+            if let Some(evict_ms) = self.evict_ms {
+                block.push_str(&format!(", wallet freed {}", ms(evict_ms)));
             }
+            if self.delta_undone {
+                block.push_str(", Core delta undone");
+            }
+            block.push(')');
             block
         } else {
             format!(
@@ -344,13 +370,7 @@ impl Row {
             "{:>2} {:<9} tip{:<4} utxos {:<7} stale_in_core={}{} grpc={:<15} ({:>3}ms) \
              mempool={:<5} template={:<6} input={:<28} | {}",
             self.round,
-            match self.kind {
-                Some(Kind::Normal) => "normal",
-                Some(Kind::Stale) => "STALE",
-                Some(Kind::Immediate) => "immediate",
-                Some(Kind::TipPoll) => "tip-poll",
-                None => "?",
-            },
+            self.kind.map_or("?", Kind::label),
             self.tip_height,
             self.utxos
                 .map_or_else(|| "-".to_owned(), |(c, u)| format!("{c}c/{u}u")),
@@ -380,14 +400,16 @@ fn table(mode: Mode, rows: &[Row]) -> String {
          baseline, then {SETTLED_PAIRS} (STALE, normal) pairs where the re-bid waits for the \
          wallet to free the stale bid's inputs, then {IMMEDIATE_PAIRS} (STALE, immediate) pairs \
          where the re-bid goes out on the ConnectBlock event, then {TIP_POLL_PAIRS} (STALE, \
-         tip-poll) pairs where it goes out as soon as GetChainTip shows the new block. \
-         stale_in_core* = counted after the bid.\n"
+         tip-poll) pairs where it goes out as soon as GetChainTip shows the new block, then \
+         {FORCED_PAIRS} (STALE, forced) pairs where the test undoes the enforcer's \
+         deprioritisation of the stale bid in Core before a settled re-bid. stale_in_core* = \
+         counted after the bid.\n"
     );
     for row in rows {
         out.push_str(&row.line());
         out.push('\n');
     }
-    for kind in [Kind::Normal, Kind::Immediate, Kind::TipPoll] {
+    for kind in [Kind::Normal, Kind::Immediate, Kind::TipPoll, Kind::Forced] {
         let rebids: Vec<&Row> = rows
             .iter()
             .filter(|row| row.is_rebid() && row.kind == Some(kind))
@@ -396,11 +418,7 @@ fn table(mode: Mode, rows: &[Row]) -> String {
         out.push_str(&format!(
             "{} re-bids after a stale round: {}/{} in the next block; refused {}, created but not \
              in Core's mempool {}, chained on a stale bid {}, replaced a stale bid {}\n",
-            match kind {
-                Kind::Normal => "settled",
-                Kind::Immediate => "immediate",
-                _ => "tip-poll",
-            },
+            kind.label(),
             count(&|row| row.ok()),
             rebids.len(),
             count(&|row| matches!(row.bid.grpc, Some(Err(_)))),
@@ -490,6 +508,7 @@ pub async fn test_bmm_same_bid_after_stale(mut post_setup: PostSetup) -> anyhow:
         .chain((0..SETTLED_PAIRS).flat_map(|_| [Kind::Stale, Kind::Normal]))
         .chain((0..IMMEDIATE_PAIRS).flat_map(|_| [Kind::Stale, Kind::Immediate]))
         .chain((0..TIP_POLL_PAIRS).flat_map(|_| [Kind::Stale, Kind::TipPoll]))
+        .chain((0..FORCED_PAIRS).flat_map(|_| [Kind::Stale, Kind::Forced]))
         .collect();
     let mut stale_bids = Vec::<StaleBid>::new();
     let mut rows = Vec::<Row>::new();
@@ -629,6 +648,34 @@ pub async fn test_bmm_same_bid_after_stale(mut post_setup: PostSetup) -> anyhow:
                         .map(|_| started.elapsed().as_millis()),
                     );
                 }
+                if next == Some(Kind::Forced)
+                    && let Some(Ok(txid)) = row.bid.grpc.clone().filter(|_| row.bid.in_mempool)
+                {
+                    // Wait for the enforcer's deprioritisation to land, then
+                    // undo it: the stale bid is full-fee in Core again.
+                    let deprioritized = poll_elapsed(EVICT_WAIT, || async {
+                        let entry: serde_json::Value = post_setup
+                            .bitcoind_client
+                            .request("getmempoolentry", rpc_params![txid])
+                            .await?;
+                        let base = entry["fees"]["base"].as_f64().unwrap_or(0.0);
+                        let modified = entry["fees"]["modified"].as_f64().unwrap_or(0.0);
+                        Ok(modified < base)
+                    })
+                    .await;
+                    anyhow::ensure!(
+                        deprioritized.is_some(),
+                        "the enforcer never deprioritised stale bid {txid} in Core"
+                    );
+                    let _undone: bool = post_setup
+                        .bitcoind_client
+                        .request(
+                            "prioritisetransaction",
+                            rpc_params![txid, 0, -NEGATIVE_MAX_SATS],
+                        )
+                        .await?;
+                    row.delta_undone = true;
+                }
             }
         } else {
             let () = mine_check_block_events::<_, DummySidechain>(
@@ -685,11 +732,7 @@ pub async fn test_bmm_same_bid_after_stale(mut post_setup: PostSetup) -> anyhow:
             failed.len(),
             rebids.len(),
             first.round,
-            match first.kind {
-                Some(Kind::Immediate) => "immediate",
-                Some(Kind::TipPoll) => "tip-poll",
-                _ => "settled",
-            },
+            first.kind.map_or("?", Kind::label),
         );
     }
     Ok(())

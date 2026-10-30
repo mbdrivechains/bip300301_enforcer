@@ -1062,16 +1062,34 @@ pub enum BuildBmmTx {
     #[error(transparent)]
     CreateTx(#[from] bdk_wallet::error::CreateTxError),
     #[error(transparent)]
+    GetHeaderInfo(#[from] validator::GetHeaderInfoError),
+    #[error(transparent)]
     NotUnlocked(#[from] NotUnlocked),
+    /// Persisting the stale BMM request eviction done before coin selection
+    #[error("failed to persist wallet after evicting stale BMM requests")]
+    PersistWallet(#[source] SqliteError),
     #[error(transparent)]
     Script(#[from] bitcoin::script::PushBytesError),
+    /// The wallet did not connect the tip the bid is for in time
+    #[error(
+        "wallet has not connected the tip {tip} (height {tip_height}) yet; wallet tip is \
+         {wallet_tip} (height {wallet_tip_height})"
+    )]
+    WalletBehindTip {
+        tip: bitcoin::BlockHash,
+        tip_height: u32,
+        wallet_tip: bitcoin::BlockHash,
+        wallet_tip_height: u32,
+    },
 }
 
 impl ToStatus for BuildBmmTx {
     fn builder(&self) -> StatusBuilder<'_> {
         match self {
             Self::CreateTx(err) => StatusBuilder::new(err),
+            Self::GetHeaderInfo(err) => err.builder(),
             Self::NotUnlocked(err) => err.builder(),
+            Self::PersistWallet(_) | Self::WalletBehindTip { .. } => StatusBuilder::new(self),
             Self::Script(err) => StatusBuilder::new(err),
         }
     }
@@ -1087,6 +1105,12 @@ pub(in crate::wallet) enum CreateBmmRequestInner {
     BroadcastTxRpc(#[source] JsonRpcError),
     #[error("broadcast deposit transaction failed: {txid}")]
     BroadcastUnsuccessful { txid: bitcoin::Txid },
+    /// The own node refused the request from its mempool and no p2p
+    /// broadcast took it either, so it reached no node at all.
+    #[error(
+        "BMM request {txid} reached no node: own node rejected it and no p2p broadcast is configured"
+    )]
+    NotBroadcast { txid: bitcoin::Txid },
     #[error(transparent)]
     GetHeaderInfo(#[from] validator::GetHeaderInfoError),
     #[error("failed to sign BMM tx")]
@@ -1101,7 +1125,8 @@ impl ToStatus for CreateBmmRequestInner {
             Self::SignTx(err) => StatusBuilder::with_code(self, err.builder()),
             Self::BroadcastNonstandardTx(_)
             | Self::BroadcastTxRpc(_)
-            | Self::BroadcastUnsuccessful { .. } => StatusBuilder::new(self),
+            | Self::BroadcastUnsuccessful { .. }
+            | Self::NotBroadcast { .. } => StatusBuilder::new(self),
         }
     }
 }
