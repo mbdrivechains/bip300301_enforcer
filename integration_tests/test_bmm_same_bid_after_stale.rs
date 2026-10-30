@@ -755,35 +755,32 @@ async fn mempool_fee_vsize(post_setup: &PostSetup, txid: &Txid) -> anyhow::Resul
     Ok((fee, vsize))
 }
 
-/// Bid on the tip, let the bid go stale (an empty block from Core), wait
-/// until the wallet freed its inputs, then re-bid the same amount. Returns
-/// the stale bid and the re-bid, each as (txid, inputs, fee, vsize), and
-/// whether the re-bid made it into the next block with its M7.
-async fn stale_then_rebid(
+/// A bid as Core holds it: txid, inputs, base fee (sats), vsize.
+type HeldBid = (Txid, Vec<OutPoint>, u64, u64);
+
+/// Bid on the tip and require Core to take it, then let it go stale (an
+/// empty block from Core) and wait until the wallet freed its inputs.
+async fn bid_then_stale(
     post_setup: &mut PostSetup,
     core_addr: &str,
     label: &str,
-) -> anyhow::Result<(
-    (Txid, Vec<OutPoint>, u64),
-    (Txid, Vec<OutPoint>, u64, u64),
-    bool,
-)> {
+) -> anyhow::Result<HeldBid> {
     let () = wait_for_wallet_sync(post_setup).await?;
     let (prev_bytes, _, tip_height) = chain_tip(post_setup).await?;
-    let h = h_star(&format!("{label}: stale bid"));
-    let stale = place_bid(post_setup, &h, prev_bytes, tip_height, &[], None).await?;
-    let Some(Ok(stale_txid)) = stale.grpc else {
-        anyhow::bail!("{label}: the first bid failed: {:?}", stale.grpc);
+    let h = h_star(&format!("{label}: bid going stale"));
+    let bid = place_bid(post_setup, &h, prev_bytes, tip_height, &[], None).await?;
+    let Some(Ok(txid)) = bid.grpc else {
+        anyhow::bail!("{label}: the bid failed: {:?}", bid.grpc);
     };
     anyhow::ensure!(
-        stale.in_mempool,
-        "{label}: the first bid never reached Core's mempool"
+        bid.in_mempool,
+        "{label}: the bid never reached Core's mempool"
     );
-    let (stale_fee, _) = mempool_fee_vsize(post_setup, &stale_txid).await?;
+    let (fee, vsize) = mempool_fee_vsize(post_setup, &txid).await?;
     let empty_block = generate_empty_block(&post_setup.bitcoind_client, core_addr).await?;
     let () = crate::block_verdict::wait_for_enforcer_tip_hash(post_setup, empty_block).await?;
     let post_setup_ref: &PostSetup = post_setup;
-    let inputs = &stale.inputs;
+    let inputs = &bid.inputs;
     let freed = poll_elapsed(EVICT_WAIT, || async move {
         let unspent = wallet_utxos(post_setup_ref).await?;
         Ok(inputs
@@ -795,24 +792,27 @@ async fn stale_then_rebid(
         freed.is_some(),
         "{label}: the wallet never freed the stale bid's inputs"
     );
+    Ok((txid, bid.inputs, fee, vsize))
+}
 
+/// Re-bid the same amount on the tip, then mine through the enforcer.
+/// Returns the re-bid and whether the block carries it with its M7.
+async fn rebid_then_mine(
+    post_setup: &mut PostSetup,
+    label: &str,
+) -> anyhow::Result<(HeldBid, bool)> {
     let () = wait_for_wallet_sync(post_setup).await?;
     let (prev_bytes, _, tip_height) = chain_tip(post_setup).await?;
     let h = h_star(&format!("{label}: re-bid"));
-    let stale_bids = [StaleBid {
-        round: 0,
-        txid: stale_txid,
-        inputs: stale.inputs.clone(),
-    }];
-    let rebid = place_bid(post_setup, &h, prev_bytes, tip_height, &stale_bids, None).await?;
-    let Some(Ok(rebid_txid)) = rebid.grpc.clone() else {
+    let rebid = place_bid(post_setup, &h, prev_bytes, tip_height, &[], None).await?;
+    let Some(Ok(txid)) = rebid.grpc.clone() else {
         anyhow::bail!("{label}: the re-bid failed: {:?}", rebid.grpc);
     };
     anyhow::ensure!(
         rebid.in_mempool,
         "{label}: the re-bid never reached Core's mempool"
     );
-    let (rebid_fee, rebid_vsize) = mempool_fee_vsize(post_setup, &rebid_txid).await?;
+    let (fee, vsize) = mempool_fee_vsize(post_setup, &txid).await?;
     let () = mine_check_block_events::<_, DummySidechain>(
         post_setup,
         1,
@@ -822,23 +822,26 @@ async fn stale_then_rebid(
     .await?;
     let (_, block_hash, _) = chain_tip(post_setup).await?;
     let block = get_block(post_setup, &block_hash).await?;
-    let mined = block_txids(&block).contains(&rebid_txid)
+    let mined = block_txids(&block).contains(&txid)
         && coinbase_m7_accepts(&block)?.iter().any(|m7| {
             m7.sidechain_number == DummySidechain::SIDECHAIN_NUMBER
                 && m7.sidechain_block_hash.0 == h
         });
-    Ok((
-        (stale_txid, stale.inputs, stale_fee),
-        (rebid_txid, rebid.inputs, rebid_fee, rebid_vsize),
-        mined,
-    ))
+    Ok(((txid, rebid.inputs, fee, vsize), mined))
+}
+
+fn shares_input(a: &HeldBid, b: &HeldBid) -> bool {
+    a.1.iter().any(|input| b.1.contains(input))
 }
 
 /// A re-bid after a stale round must also be relayable by nodes that still
-/// hold the stale bid at full fee:
+/// hold the stale bid at full fee (their enforcer has not deprioritised it,
+/// or they run none):
 /// * with one coin, the re-bid has to reuse the stale bid's coin, and must
-///   pay at least the stale bid's fee plus 1 sat/vB of its own size (a valid
-///   RBF replacement at every node)
+///   pay at least the stale bid's fee plus 1 sat/vB of its own size, a valid
+///   RBF replacement at every node
+/// * still with one coin, when that re-bid goes stale too, the next must beat
+///   the higher of the two stale fees the same way
 /// * with a second coin, the re-bid must use the fresh coin and pay exactly
 ///   the bid
 pub async fn test_bmm_rebid_coin_choice(mut post_setup: PostSetup) -> anyhow::Result<()> {
@@ -855,43 +858,72 @@ pub async fn test_bmm_rebid_coin_choice(mut post_setup: PostSetup) -> anyhow::Re
         .request("getnewaddress", rpc_params![])
         .await?;
     let () = fund_enforcer_single_utxo(&mut post_setup, &core_addr).await?;
-    let mut report = Vec::new();
+    let mut report = Vec::<String>::new();
+    let describe =
+        |label: &str, bid: &HeldBid| format!("{label} {} fee {} vsize {}", bid.0, bid.2, bid.3);
 
+    // One coin, one stale round.
     let coins = wallet_utxos(&post_setup).await?;
     anyhow::ensure!(
         coins.len() == 1,
         "expected one wallet coin, got {}",
         coins.len()
     );
-    let (
-        (stale_txid, stale_inputs, stale_fee),
-        (rebid_txid, rebid_inputs, rebid_fee, vsize),
-        mined,
-    ) = stale_then_rebid(&mut post_setup, &core_addr, "one coin").await?;
-    let reused = rebid_inputs
-        .iter()
-        .any(|input| stale_inputs.contains(input));
+    let stale = bid_then_stale(&mut post_setup, &core_addr, "one coin").await?;
+    let (rebid, mined) = rebid_then_mine(&mut post_setup, "one coin").await?;
     report.push(format!(
-        "one coin: stale {stale_txid} fee {stale_fee}; re-bid {rebid_txid} fee {rebid_fee} vsize \
-         {vsize}, reuses the stale coin: {reused}, mined with M7: {mined}"
+        "one coin: {}; {}; reuses the coin: {}; mined with M7: {mined}",
+        describe("stale", &stale),
+        describe("re-bid", &rebid),
+        shares_input(&rebid, &stale)
     ));
-    anyhow::ensure!(
-        reused,
-        "one coin: the re-bid must reuse the only coin\n{}",
-        report.join("\n")
-    );
-    anyhow::ensure!(
-        rebid_fee >= stale_fee + vsize,
-        "one coin: re-bid fee {rebid_fee} is no valid replacement for the stale bid's {stale_fee} \
-         (needs at least {} at 1 sat/vB)\n{}",
-        stale_fee + vsize,
-        report.join("\n")
-    );
-    anyhow::ensure!(
+    let check = |ok: bool, what: &str, report: &[String]| -> anyhow::Result<()> {
+        anyhow::ensure!(ok, "{what}\n{}", report.join("\n"));
+        Ok(())
+    };
+    check(
+        shares_input(&rebid, &stale),
+        "one coin: the re-bid must reuse the only coin",
+        &report,
+    )?;
+    check(
+        rebid.2 >= stale.2 + rebid.3,
+        "one coin: the re-bid is no valid replacement at 1 sat/vB",
+        &report,
+    )?;
+    check(mined, "one coin: the re-bid was not mined", &report)?;
+
+    // One coin, the re-bid goes stale too: the next must beat both.
+    let first = bid_then_stale(&mut post_setup, &core_addr, "one coin twice").await?;
+    // The first re-bid, made stale instead of mined.
+    let second = bid_then_stale(&mut post_setup, &core_addr, "one coin twice, re-bid").await?;
+    let (third, mined) = rebid_then_mine(&mut post_setup, "one coin twice").await?;
+    report.push(format!(
+        "one coin, stale twice: {}; {}; {}; mined with M7: {mined}",
+        describe("stale", &first),
+        describe("stale re-bid", &second),
+        describe("re-bid", &third)
+    ));
+    check(
+        shares_input(&second, &first) && shares_input(&third, &first),
+        "one coin, stale twice: every bid must reuse the only coin",
+        &report,
+    )?;
+    check(
+        second.2 >= first.2 + second.3,
+        "one coin, stale twice: the first re-bid is no valid replacement",
+        &report,
+    )?;
+    check(
+        third.2 >= second.2.max(first.2) + third.3,
+        "one coin, stale twice: the second re-bid must beat the higher stale fee by 1 sat/vB",
+        &report,
+    )?;
+    check(
         mined,
-        "one coin: the re-bid was not mined\n{}",
-        report.join("\n")
-    );
+        "one coin, stale twice: the re-bid was not mined",
+        &report,
+    )?;
 
     // A second coin.
     let address = post_setup
@@ -920,33 +952,30 @@ pub async fn test_bmm_rebid_coin_choice(mut post_setup: PostSetup) -> anyhow::Re
         "expected two wallet coins, got {}",
         coins.len()
     );
-    let (
-        (stale_txid, stale_inputs, stale_fee),
-        (rebid_txid, rebid_inputs, rebid_fee, vsize),
-        mined,
-    ) = stale_then_rebid(&mut post_setup, &core_addr, "two coins").await?;
-    let fresh = rebid_inputs
-        .iter()
-        .all(|input| !stale_inputs.contains(input));
+    let stale = bid_then_stale(&mut post_setup, &core_addr, "two coins").await?;
+    let (rebid, mined) = rebid_then_mine(&mut post_setup, "two coins").await?;
     report.push(format!(
-        "two coins: stale {stale_txid} fee {stale_fee}; re-bid {rebid_txid} fee {rebid_fee} vsize \
-         {vsize}, uses a fresh coin: {fresh}, mined with M7: {mined}"
+        "two coins: {}; {}; fresh coin: {}; mined with M7: {mined}",
+        describe("stale", &stale),
+        describe("re-bid", &rebid),
+        !shares_input(&rebid, &stale)
     ));
-    let report = report.join("\n");
-    tracing::info!("\n{report}");
+    let text = report.join("\n");
+    tracing::info!("\n{text}");
     #[expect(clippy::print_stderr)]
     {
-        eprintln!("\nbmm_rebid_coin_choice:\n{report}");
+        eprintln!("\nbmm_rebid_coin_choice:\n{text}");
     }
-    anyhow::ensure!(
-        fresh,
-        "two coins: the re-bid must use the fresh coin\n{report}"
-    );
-    anyhow::ensure!(
-        rebid_fee == BID_SATS,
-        "two coins: a re-bid on a fresh coin must pay exactly the bid {BID_SATS}, paid \
-         {rebid_fee}\n{report}"
-    );
-    anyhow::ensure!(mined, "two coins: the re-bid was not mined\n{report}");
+    check(
+        !shares_input(&rebid, &stale),
+        "two coins: the re-bid must use the fresh coin",
+        &report,
+    )?;
+    check(
+        rebid.2 == BID_SATS,
+        "two coins: a re-bid on a fresh coin must pay exactly the bid",
+        &report,
+    )?;
+    check(mined, "two coins: the re-bid was not mined", &report)?;
     Ok(())
 }

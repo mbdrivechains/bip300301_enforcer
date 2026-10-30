@@ -1889,10 +1889,12 @@ impl Wallet {
     }
 
     /// Wallet coins that a stale BMM request (one not bidding on
-    /// `mainchain_tip`) spent, each with that request's fee. The wallet has
-    /// evicted those requests and counts the coins unspent again, but the
-    /// requests can linger at full fee in the mempools of nodes whose
-    /// enforcer has not deprioritised them (or that run none).
+    /// `mainchain_tip`) spent, each with the highest-fee such request. The
+    /// wallet has evicted those requests and counts the coins unspent again,
+    /// but they can linger at full fee in the mempools of nodes whose
+    /// enforcer has not deprioritised them (or that run none). A coin re-bid
+    /// on more than once has several, each replacing the last; a node can
+    /// hold any one of them, so a valid replacement must beat the highest.
     fn stale_spent_coins(
         wallet: &bdk_wallet::Wallet,
         mainchain_tip: bitcoin::BlockHash,
@@ -1901,16 +1903,21 @@ impl Wallet {
         wallet
             .list_unspent()
             .filter_map(|utxo| {
-                graph.outspends(utxo.outpoint).iter().find_map(|txid| {
-                    let tx = graph.get_tx(*txid)?;
-                    let script = tx.output.first()?.script_pubkey.to_bytes();
-                    let (_rest, m8) = M8BmmRequest::parse(&script).ok()?;
-                    if m8.prev_mainchain_block_hash == mainchain_tip {
-                        return None;
-                    }
-                    let fee = graph.calculate_fee(&tx).ok()?;
-                    Some((utxo.outpoint, (*txid, fee)))
-                })
+                graph
+                    .outspends(utxo.outpoint)
+                    .iter()
+                    .filter_map(|txid| {
+                        let tx = graph.get_tx(*txid)?;
+                        let script = tx.output.first()?.script_pubkey.to_bytes();
+                        let (_rest, m8) = M8BmmRequest::parse(&script).ok()?;
+                        if m8.prev_mainchain_block_hash == mainchain_tip {
+                            return None;
+                        }
+                        let fee = graph.calculate_fee(&tx).ok()?;
+                        Some((*txid, fee))
+                    })
+                    .max_by_key(|(_txid, fee)| *fee)
+                    .map(|stale| (utxo.outpoint, stale))
             })
             .collect()
     }
@@ -1970,8 +1977,8 @@ impl Wallet {
             let replaced_fees: Amount = replaced.iter().map(|(_txid, fee)| *fee).sum();
             let vsize = psbt.unsigned_tx.vsize() as u64
                 + MAX_INPUT_WITNESS_VBYTES * psbt.unsigned_tx.input.len() as u64;
-            let required = replaced_fees
-                + Amount::from_sat((increment_sat_per_kvb * vsize).div_ceil(1000));
+            let required =
+                replaced_fees + Amount::from_sat((increment_sat_per_kvb * vsize).div_ceil(1000));
             if fee >= required || attempt == MAX_ATTEMPTS {
                 tracing::info!(
                     bid = %bid_amount,
