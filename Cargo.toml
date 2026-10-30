@@ -128,4 +128,4 @@ branch = "log-rotation-size"
 # timeout, template times, rejected-tx tombstones, bip300301_enforcer#634 retry, reconsider rejected txs) + upstream
 # PR #139 (saturating ancestor/descendant fee subtraction: the 10-29 "Amount subtraction error" panic). Drop to revert.
 [patch."https://github.com/LayerTwo-Labs/cusf-enforcer-mempool.git"]
-cusf-enforcer-mempool = { path = "../cusf-mempool-v101/lib" }
+cusf-enforcer-mempool = { git = "https://github.com/mbdrivechains/cusf-enforcer-mempool.git", rev = "01d1e141efd7f095018887278fbe63e575283feb" }
