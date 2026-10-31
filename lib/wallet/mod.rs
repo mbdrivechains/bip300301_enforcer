@@ -2448,3 +2448,84 @@ impl Wallet {
         self.inner.create_new_wallet(mnemonic, password).await
     }
 }
+
+#[cfg(test)]
+mod genesis_tests {
+    use bdk_wallet::bitcoin::{
+        BlockHash, CompactTarget, Network as BdkNetwork, Transaction, TxMerkleNode,
+        absolute::LockTime, block, constants::genesis_block, hashes::Hash as _,
+        transaction::Version,
+    };
+    use clap::Parser as _;
+
+    use super::*;
+
+    /// easynet's genesis (`getblockhash 0` on an easynet node, reset 4).
+    const EASYNET_GENESIS: &str =
+        "000000018a449eb24e2c55744a19ad02db5928fa89296f87cbb2059784b2b211";
+
+    #[derive(clap::Parser)]
+    struct TestArgs {
+        #[command(flatten)]
+        wallet: WalletConfig,
+    }
+
+    async fn new_wallet(dir: &temp_dir::TempDir, genesis_hash: BlockHash) -> BdkWallet {
+        let mut database = Persistence::open(dir.path().join("wallet.sqlite.db"))
+            .await
+            .unwrap();
+        let mnemonic = mnemonic::new_mnemonic().unwrap();
+        let config = TestArgs::parse_from(["test"]).wallet;
+        WalletInner::initialize_wallet_from_mnemonic(
+            &mnemonic,
+            BdkNetwork::Testnet4,
+            genesis_hash,
+            &config,
+            &mut database,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn block_one(prev_blockhash: BlockHash) -> bdk_wallet::bitcoin::Block {
+        bdk_wallet::bitcoin::Block {
+            header: block::Header {
+                version: block::Version::TWO,
+                prev_blockhash,
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: 0,
+                bits: CompactTarget::from_consensus(0x1d00ffff),
+                nonce: 0,
+            },
+            txdata: vec![Transaction {
+                version: Version::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![],
+                output: vec![],
+            }],
+        }
+    }
+
+    /// easynet runs under testnet4's parameters with its own genesis: a new
+    /// wallet must start from the node's genesis, or block 1 never connects
+    /// and the wallet task (and the enforcer) exits at start.
+    #[tokio::test]
+    async fn new_wallet_starts_from_the_nodes_genesis() {
+        let easynet: BlockHash = EASYNET_GENESIS.parse().unwrap();
+        let testnet4 = genesis_block(BdkNetwork::Testnet4).block_hash();
+        assert_ne!(easynet, testnet4);
+
+        let dir = temp_dir::TempDir::new().unwrap();
+        let mut wallet = new_wallet(&dir, easynet).await;
+        assert_eq!(wallet.local_chain().genesis_hash(), easynet);
+        wallet
+            .apply_block(&block_one(easynet), 1)
+            .expect("block 1 on the node's genesis connects");
+
+        // What the wallet did before: testnet4's genesis, so easynet's block 1
+        // cannot connect.
+        let dir = temp_dir::TempDir::new().unwrap();
+        let mut wallet = new_wallet(&dir, testnet4).await;
+        assert!(wallet.apply_block(&block_one(easynet), 1).is_err());
+    }
+}

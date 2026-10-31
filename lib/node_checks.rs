@@ -314,4 +314,52 @@ mod tests {
         let no_txindex: HashMap<String, IndexInfo> = serde_json::from_str("{}").unwrap();
         assert!(!no_txindex.contains_key("txindex"));
     }
+
+    #[test]
+    fn network_from_core_chain_maps_easynet_to_testnet4() {
+        assert_eq!(
+            network_from_core_chain("easynet"),
+            Some(bitcoin::Network::Testnet4)
+        );
+        assert_eq!(
+            network_from_core_chain("main"),
+            Some(bitcoin::Network::Bitcoin)
+        );
+        assert_eq!(
+            network_from_core_chain("test"),
+            Some(bitcoin::Network::Testnet)
+        );
+        assert_eq!(
+            network_from_core_chain("testnet4"),
+            Some(bitcoin::Network::Testnet4)
+        );
+        assert_eq!(
+            network_from_core_chain("signet"),
+            Some(bitcoin::Network::Signet)
+        );
+        assert_eq!(
+            network_from_core_chain("regtest"),
+            Some(bitcoin::Network::Regtest)
+        );
+        assert_eq!(network_from_core_chain("betanet"), None);
+        assert_eq!(network_from_core_chain(""), None);
+    }
+
+    #[test]
+    fn deserialize_node_chain_info_raw_with_unknown_chain() {
+        // getblockchaininfo from an easynet node: rust-bitcoin's typed
+        // response would refuse the chain name; the raw one keeps it.
+        let info: NodeChainInfoRaw = serde_json::from_str(
+            r#"{"chain":"easynet","blocks":504,"headers":504,
+                "bestblockhash":"0000000009bb5205033af3b01393800258682f28fa124a4ae5e040137803e9b7",
+                "pruned":false,"warnings":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(info.chain, "easynet");
+        assert_eq!(info.blocks, 504);
+        assert_eq!(
+            network_from_core_chain(&info.chain),
+            Some(bitcoin::Network::Testnet4)
+        );
+    }
 }
